@@ -69,8 +69,9 @@ export interface ChannelBinding {
    * Optional base URL of a DKG explorer scoped to this channel's Context
    * Graph; when set (or when the global BDI_EXPLORER_URL fallback is),
    * receipts carry a markdown link so clients that render markdown (Buzz
-   * desktop) get a click-through into the graph. Purely presentational —
-   * absent, receipts are byte-identical to the pre-explorer format.
+   * desktop) get a click-through into the graph. The anchored machine-readable
+   * lines remain unchanged; the lead line and optional trailing link are
+   * presentational and are not parsed.
    */
   explorerUrl?: string;
 }

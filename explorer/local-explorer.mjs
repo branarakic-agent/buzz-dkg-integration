@@ -8,10 +8,11 @@
 // their own node. If the viewer runs no node, or their node has not subscribed
 // to the Context Graph the KA lives in, the page explains exactly which step
 // is missing instead of showing the data. Access control is the DKG's own
-// participation model (SWM syncs only to subscribed nodes; curated CGs
-// enforce their allowlist at subscribe time) — there is no shared proxy, no
-// shared bearer token, and this server refuses to bind to anything but
-// loopback.
+// participation model (SWM syncs only to subscribed nodes; curated CGs enforce
+// their allowlist at subscribe time). The loopback default serves only the
+// viewer. A non-loopback bind is an explicit community-gateway trust boundary:
+// this process then proxies its node bearer token, so startup requires a CG
+// publication allowlist, caller secret, Host/origin allowlists, and rate limit.
 //
 // Run:  node explorer/local-explorer.mjs
 // Env:  DKG_API        node API (default http://127.0.0.1:9200)
@@ -19,12 +20,19 @@
 //       DKG_TOKEN_PATH path to auth.token (default $DKG_HOME/auth.token,
 //                      falling back to ~/.dkg-mainnet/auth.token)
 //       PORT           default 9295
+//       EXPLORER_ALLOWED_ORIGINS comma-separated desktop origins
+// Gateway-only required env:
+//       EXPLORER_PUBLIC_CGS, EXPLORER_GATEWAY_SECRET, EXPLORER_ALLOWED_HOSTS
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { createExplorerSecurity, validateExplorerInput } from './security.mjs';
 
 const PORT = Number(process.env.PORT ?? 9295);
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT must be 1..65535');
+const BIND = process.env.EXPLORER_BIND ?? '127.0.0.1';
 const NODE_API = (process.env.DKG_API ?? 'http://127.0.0.1:9200').replace(/\/$/, '');
+const SECURITY = createExplorerSecurity({ bind: BIND, port: PORT });
 
 function loadToken() {
   if (process.env.DKG_TOKEN) return process.env.DKG_TOKEN.trim();
@@ -49,6 +57,7 @@ function loadToken() {
   return null;
 }
 const TOKEN = loadToken();
+if (SECURITY.gateway && !TOKEN) throw new Error('gateway mode requires a readable DKG bearer token');
 
 async function node(path, init = {}) {
   const res = await fetch(`${NODE_API}${path}`, {
@@ -704,56 +713,66 @@ async function evidenceEnvelope(cg, uri) {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
   try {
+    if (req.method === 'OPTIONS' && url.pathname.startsWith('/api/')) {
+      const cg = url.searchParams.get('cg') || '';
+      const headers = SECURITY.authorize(req, cg, { preflight: true });
+      res.writeHead(204, headers);
+      return res.end();
+    }
     if (url.pathname === '/api/channel-memory') {
-      const cg = url.searchParams.get('cg');
+      const cg = validateExplorerInput(url.searchParams.get('cg'), 'cg');
       if (!cg) throw Object.assign(new Error('cg required'), { status: 400 });
+      const headers = SECURITY.authorize(req, cg);
       const out = await channelMemory(cg);
-      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+      res.writeHead(200, { 'content-type': 'application/json', ...headers });
       return res.end(JSON.stringify(out));
     }
     if (url.pathname === '/api/subgraph-graph') {
-      const cg = url.searchParams.get('cg');
-      const name = url.searchParams.get('name');
-      if (!cg || !name) throw Object.assign(new Error('cg and name required'), { status: 400 });
+      const cg = validateExplorerInput(url.searchParams.get('cg'), 'cg');
+      const name = validateExplorerInput(url.searchParams.get('name'), 'name');
+      const headers = SECURITY.authorize(req, cg);
       const out = await subgraphGraph(cg, name);
-      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+      res.writeHead(200, { 'content-type': 'application/json', ...headers });
       return res.end(JSON.stringify(out));
     }
     if (url.pathname === '/api/subgraph-triples') {
-      const cg = url.searchParams.get('cg');
-      const name = url.searchParams.get('name');
-      if (!cg || !name) throw Object.assign(new Error('cg and name required'), { status: 400 });
+      const cg = validateExplorerInput(url.searchParams.get('cg'), 'cg');
+      const name = validateExplorerInput(url.searchParams.get('name'), 'name');
+      const headers = SECURITY.authorize(req, cg);
       const out = await subgraphTriples(cg, name);
-      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+      res.writeHead(200, { 'content-type': 'application/json', ...headers });
       return res.end(JSON.stringify(out));
     }
     if (url.pathname === '/api/evidence') {
-      const cg = url.searchParams.get('cg');
-      const uri = url.searchParams.get('uri');
-      if (!cg || !uri) throw Object.assign(new Error('cg and uri required'), { status: 400 });
+      const cg = validateExplorerInput(url.searchParams.get('cg'), 'cg');
+      const uri = validateExplorerInput(url.searchParams.get('uri'), 'uri');
+      const headers = SECURITY.authorize(req, cg);
       const out = await evidenceEnvelope(cg, uri);
-      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+      res.writeHead(200, { 'content-type': 'application/json', ...headers });
       return res.end(JSON.stringify(out));
     }
     if (url.pathname === '/api/contributor-trail') {
-      const cg = url.searchParams.get('cg');
-      const pk = url.searchParams.get('pubkey');
-      if (!cg || !pk) throw Object.assign(new Error('cg and pubkey required'), { status: 400 });
+      const cg = validateExplorerInput(url.searchParams.get('cg'), 'cg');
+      const pk = validateExplorerInput(url.searchParams.get('pubkey'), 'pubkey');
+      const headers = SECURITY.authorize(req, cg);
       const out = await contributorTrail(cg, pk);
-      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+      res.writeHead(200, { 'content-type': 'application/json', ...headers });
       return res.end(JSON.stringify(out));
     }
     if (url.pathname === '/api/resolve') {
-      const cg = url.searchParams.get('cg');
-      const ual = url.searchParams.get('ual');
-      if (!cg || !ual) throw Object.assign(new Error('cg and ual required'), { status: 400 });
+      const cg = validateExplorerInput(url.searchParams.get('cg'), 'cg');
+      const ual = validateExplorerInput(url.searchParams.get('ual'), 'ual');
+      const headers = SECURITY.authorize(req, cg);
       const out = await resolve(cg, ual);
-      res.writeHead(200, { 'content-type': 'application/json' });
+      res.writeHead(200, { 'content-type': 'application/json', ...headers });
       return res.end(JSON.stringify(out));
     }
     if (url.pathname === '/explore') {
       const cg = url.searchParams.get('cg') ?? '';
       const ual = url.searchParams.get('ual') ?? '';
+      if (SECURITY.gateway) {
+        throw Object.assign(new Error('interactive explorer links are local-only'), { status: 404 });
+      }
       // Gate server-side first: a viewer whose node participates in the CG is
       // handed straight into their edge node's own UI, landed on the KA.
       // Only a failing gate renders this explorer's instruction page.
@@ -778,16 +797,13 @@ const server = createServer(async (req, res) => {
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'not found' }));
   } catch (err) {
-    res.writeHead(err.status ?? 500, { 'content-type': 'application/json' });
+    res.writeHead(err.status ?? 500, { 'content-type': 'application/json', ...(err.headers || {}) });
     res.end(JSON.stringify({ error: String(err.message ?? err) }));
   }
 });
 
-// Default loopback (per-viewer resolution). EXPLORER_BIND=0.0.0.0 opts the
-// operator into "community gateway" mode (RFC deployment profile 2): tailnet
-// members read this node's view, honestly labeled as gateway-resolved.
-const BIND = process.env.EXPLORER_BIND ?? '127.0.0.1';
 server.listen(PORT, BIND, () => {
   console.log(`local-first DKG explorer on http://${BIND}:${PORT}`);
   console.log(`  node API: ${NODE_API} (token ${TOKEN ? 'loaded' : 'MISSING'})`);
+  console.log(`  mode: ${SECURITY.gateway ? 'authenticated community gateway' : 'loopback viewer'}`);
 });

@@ -414,7 +414,6 @@ export class Daemon {
     }
   }
 
-  /** Read-back before retry (§9): find a receipt we may have posted pre-crash. */
   /** Per-binding explorer link base, falling back to the global config value. */
   explorerUrlFor(channelId: string): string | undefined {
     return (
@@ -423,6 +422,7 @@ export class Daemon {
     );
   }
 
+  /** Read-back before retry (§9): find a receipt we may have posted pre-crash. */
   async findExistingReceipt(op: OpRecord): Promise<string | null> {
     const mine = await this.relay.query([
       { kinds: [9], '#h': [op.channelId], '#e': [op.rootEventId], authors: [this.relay.pubkey] },

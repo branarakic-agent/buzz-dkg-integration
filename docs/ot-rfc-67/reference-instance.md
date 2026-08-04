@@ -32,8 +32,9 @@ Existing Buzz member (desktop app, unchanged Nostr identity)
 - **Community provider**: [`explorer/local-explorer.mjs`](../../explorer/local-explorer.mjs)
   — loopback by default; `EXPLORER_BIND=0.0.0.0` opts into community-provider
   mode, published to members over a private network (Tailscale) behind TLS.
-  Per the RFC: private-network operation, reported as such, never presented as
-  a public deployment.
+  Gateway mode additionally requires an explicit served-CG allowlist, caller
+  secret, expected Host/origin allowlists, and rate limit. Per the RFC:
+  private-network operation, reported as such, never presented as public.
 - **Client**: Buzz desktop with the memory-panel feature
   ([patch](../../patches/buzz-desktop-dkg-memory-gateway.patch)) resolving
   local-node → community provider → discovery, in that order.
@@ -86,6 +87,6 @@ by e2e tests in the client patch.
 
 No `buzz-dkg` installer, no adoption planner, no managed backup/rollback, no
 Part-2 `ReputationProvider` envelope on the provider API (it serves the memory
-surface, not trust-claim discovery), and no confidentiality beyond
-private-network access control. Those are precisely the gaps Beta V1 specifies
-the product should close.
+surface, not trust-claim discovery), and no per-member authorization beyond the
+gateway secret plus private-network access control. Those are precisely the
+gaps Beta V1 specifies the product should close.

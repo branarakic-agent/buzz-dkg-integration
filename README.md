@@ -184,6 +184,12 @@ alongside them.
    at the wrong port (`ECONNREFUSED`); a promoter pubkey in the wrong format
    (npub is accepted and decoded; anything else fails fast at startup).
 
+   If a relay's live WebSocket fan-out is known to be broken, set
+   `BDI_POLL_INTERVAL_S=5` (or higher) to enable HTTP replay polling. `0` keeps
+   it disabled; values between 0 and 5 are rejected to prevent a hot loop.
+   `BDI_EXPLORER_URL` and per-binding `explorerUrl` values must be markdown-safe
+   HTTP(S) URLs because the signed receipt renders them as links.
+
 ## Run (isolated stack) — ~10 minutes
 
 Reproduces the full demo end-to-end with no external dependencies.

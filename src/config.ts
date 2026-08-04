@@ -40,6 +40,24 @@ export function parseTokenFile(raw: string): string {
   return line;
 }
 
+export function normalizeExplorerUrl(raw: string, ctx: string): string {
+  const value = String(raw).trim();
+  if (!value || /[\s()<>{}\[\]]/u.test(value)) {
+    throw new Error(`${ctx} must be a markdown-safe http(s) URL`);
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${ctx} must be a valid URL`);
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    throw new Error(`${ctx} must be an http(s) URL without credentials`);
+  }
+  if (url.search || url.hash) throw new Error(`${ctx} must not contain a query or fragment`);
+  return value.replace(/\/$/, '');
+}
+
 /**
  * Channel bindings come from a JSON file (BDI_BINDINGS_PATH):
  *   [{ "channelId": "<uuid>", "contextGraphId": "<cg>", "promoters": ["<hex-pubkey>", ...] }]
@@ -64,7 +82,9 @@ export function parseBindings(raw: string): ChannelBinding[] {
             normalizePubkey(String(p), `bindings[${i}].promoters[${j}]`),
           )
         : [],
-      ...(b.explorerUrl ? { explorerUrl: String(b.explorerUrl).replace(/\/$/, '') } : {}),
+      ...(b.explorerUrl
+        ? { explorerUrl: normalizeExplorerUrl(String(b.explorerUrl), `bindings[${i}].explorerUrl`) }
+        : {}),
     };
   });
 }
@@ -88,9 +108,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DaemonConfig {
     );
   }
   const pollIntervalS = Number(env.BDI_POLL_INTERVAL_S ?? 0);
-  if (!Number.isFinite(pollIntervalS) || pollIntervalS < 0) {
+  if (
+    !Number.isFinite(pollIntervalS) ||
+    pollIntervalS < 0 ||
+    (pollIntervalS > 0 && pollIntervalS < 5)
+  ) {
     throw new Error(
-      `BDI_POLL_INTERVAL_S must be a non-negative number, got '${env.BDI_POLL_INTERVAL_S}'`,
+      `BDI_POLL_INTERVAL_S must be 0 (disabled) or at least 5 seconds, got '${env.BDI_POLL_INTERVAL_S}'`,
     );
   }
   return {
@@ -107,6 +131,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DaemonConfig {
     pollIntervalS,
     dbPath: env.BDI_DB_PATH ?? './data/daemon.db',
     bindings: parseBindings(readFileSync(required('BDI_BINDINGS_PATH', env), 'utf8')),
-    ...(env.BDI_EXPLORER_URL ? { explorerUrl: env.BDI_EXPLORER_URL.replace(/\/$/, '') } : {}),
+    ...(env.BDI_EXPLORER_URL
+      ? { explorerUrl: normalizeExplorerUrl(env.BDI_EXPLORER_URL, 'BDI_EXPLORER_URL') }
+      : {}),
   };
 }

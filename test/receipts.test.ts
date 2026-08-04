@@ -88,4 +88,14 @@ describe('bindings explorerUrl parsing', () => {
     );
     expect(b!.explorerUrl).toBeUndefined();
   });
+
+  it('rejects unsafe schemes and markdown-breaking explorer URLs', () => {
+    for (const explorerUrl of ['javascript:alert(1)', 'https://host/) [forged](https://evil)']) {
+      expect(() =>
+        parseBindings(
+          JSON.stringify([{ channelId: 'c', contextGraphId: 'g', promoters: [], explorerUrl }]),
+        ),
+      ).toThrow(/explorerUrl/);
+    }
+  });
 });

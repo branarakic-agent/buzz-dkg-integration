@@ -71,12 +71,23 @@ On the community host (one machine can run all of it):
    # loopback (per-viewer resolution, default):
    node explorer/local-explorer.mjs
    # community-provider mode (members without a node read your view):
-   EXPLORER_BIND=0.0.0.0 node explorer/local-explorer.mjs
+   EXPLORER_BIND=0.0.0.0 \
+   EXPLORER_PUBLIC_CGS='0xCommunity/web-of-trust' \
+   EXPLORER_GATEWAY_SECRET='generate-at-least-32-random-characters' \
+   EXPLORER_ALLOWED_HOSTS='wot-gateway.example.ts.net' \
+   EXPLORER_ALLOWED_ORIGINS='tauri://localhost,http://tauri.localhost' \
+   node explorer/local-explorer.mjs
    ```
 
-   Publish it to members over a private network (e.g. Tailscale) behind TLS,
-   and keep [`node-watchdog.sh`](../../node-watchdog.sh) on a timer so the
-   provider self-heals.
+   Publish it to members over a private network (e.g. Tailscale) behind TLS.
+   Give the same gateway secret to test clients through the
+   `dkg-memory-gateway-token` localStorage key. Only Context Graphs explicitly
+   listed in `EXPLORER_PUBLIC_CGS` are served; gateway startup fails closed if
+   the graph, secret, or Host allowlist is missing.
+
+   [`node-watchdog.sh`](../../node-watchdog.sh) is an optional operator example.
+   Configure its service manager, token, graph, logs, thresholds, and evidence
+   directory explicitly before putting it on a timer.
 
 Members then: install the client → add your relay → open the Web of Trust
 channel → click **◈ Memory**. No DKG node needed on their devices; the panel

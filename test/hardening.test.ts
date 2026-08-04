@@ -28,6 +28,12 @@ describe('config hardening', () => {
     );
   });
 
+  it('rejects a positive poll interval below the five-second safety floor', () => {
+    expect(() => loadConfig({ BDI_DKG_TOKEN: 'x', BDI_POLL_INTERVAL_S: '0.001' } as never)).toThrow(
+      /at least 5 seconds/,
+    );
+  });
+
   it('normalizes a hex promoter pubkey and decodes an npub', () => {
     const hex = 'ab'.repeat(32);
     expect(normalizePubkey(hex.toUpperCase(), 'x')).toBe(hex);
