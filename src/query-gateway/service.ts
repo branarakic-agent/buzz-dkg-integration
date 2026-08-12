@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { DkgClient } from '../dkg/client.ts';
 import { IntegrationApiError } from '../errors.ts';
 import { canonicalRepositoryIdentityUrl } from '../memory/identity.ts';
@@ -305,13 +306,17 @@ function safeDerivedIri(value: string): boolean {
   return SAFE_IRI.test(value);
 }
 
-export function withGatewayTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+export function withGatewayTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  onTimeout?: () => void,
+): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new IntegrationApiError(504, 'gateway_timeout', 'operation timed out')),
-      timeoutMs,
-    );
+    timer = setTimeout(() => {
+      onTimeout?.();
+      reject(new IntegrationApiError(504, 'gateway_timeout', 'operation timed out'));
+    }, timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => {
     if (timer) clearTimeout(timer);
@@ -333,6 +338,8 @@ export class QueryGatewayService {
   readonly #readLimiter: DkgReadLimiter;
   readonly #cache = new Map<string, QueryCacheEntry>();
   readonly #pending = new Map<string, Promise<QueryGatewaySuccess>>();
+  readonly #channelGeneration = new Map<string, number>();
+  readonly #executionSignal = new AsyncLocalStorage<AbortSignal>();
   readonly dkg: DkgClient;
   readonly config: EnabledGatewayConfig;
   #consecutiveFailures = 0;
@@ -363,6 +370,7 @@ export class QueryGatewayService {
   }
 
   invalidateChannel(channelId: string): void {
+    this.#channelGeneration.set(channelId, (this.#channelGeneration.get(channelId) ?? 0) + 1);
     for (const [key, entry] of this.#cache) {
       if (entry.channelId === channelId) this.#cache.delete(key);
     }
@@ -379,9 +387,11 @@ export class QueryGatewayService {
       );
     }
     const now = Date.now();
+    const generation = this.#channelGeneration.get(request.channelId) ?? 0;
     this.#pruneCache(now);
     const key = JSON.stringify([
       request.channelId,
+      generation,
       cg,
       request.operation,
       'scope' in request ? request.scope : null,
@@ -411,7 +421,11 @@ export class QueryGatewayService {
     }
 
     observe?.('miss');
-    const work = withGatewayTimeout(this.dispatch(cg, request), this.config.operationTimeoutMs)
+    const controller = new AbortController();
+    const dispatch = this.#executionSignal.run(controller.signal, () => this.dispatch(cg, request));
+    const work = withGatewayTimeout(dispatch, this.config.operationTimeoutMs, () =>
+      controller.abort(),
+    )
       .then((result) => {
         this.#consecutiveFailures = 0;
         this.#circuitOpenUntil = 0;
@@ -425,7 +439,10 @@ export class QueryGatewayService {
         if (Buffer.byteLength(JSON.stringify(value), 'utf8') > this.config.maxResultBytes) {
           throw new IntegrationApiError(502, 'result_too_large', 'query result exceeds the limit');
         }
-        if (this.config.cacheTtlMs > 0) {
+        if (
+          this.config.cacheTtlMs > 0 &&
+          (this.#channelGeneration.get(request.channelId) ?? 0) === generation
+        ) {
           this.#cache.set(key, {
             channelId: request.channelId,
             expiresAt: Date.now() + this.config.cacheTtlMs,
@@ -503,11 +520,13 @@ export class QueryGatewayService {
     subGraphName?: string,
     timeoutMs = this.config.dkgTimeoutMs,
   ): Promise<{ bindings: BindingRow[]; quads?: unknown[] }> {
-    const response = await this.#readLimiter.run(() =>
-      this.dkg.query(
-        { contextGraphId: cg, view, sparql, ...(subGraphName ? { subGraphName } : {}) },
-        timeoutMs,
-      ),
+    const response = await this.#readLimiter.run(
+      () =>
+        this.dkg.query(
+          { contextGraphId: cg, view, sparql, ...(subGraphName ? { subGraphName } : {}) },
+          timeoutMs,
+        ),
+      this.#executionSignal.getStore(),
     );
     const rows = response?.result?.bindings;
     if (!Array.isArray(rows)) throw new Error('DKG query returned an invalid bindings shape');
@@ -597,6 +616,10 @@ export class QueryGatewayService {
       `SELECT DISTINCT ?rowType ?g ?name ?s ?digest ?t ?pk ?event ?at WHERE {
         GRAPH ?g {
           {
+            BIND("graph" AS ?rowType)
+          }
+          UNION
+          {
             ?s a <${BUZZ}DecisionCluster> .
             OPTIONAL { ?s <${SCHEMA}name> ?name }
             OPTIONAL { ?s <${BUZZ}sourceSetDigest> ?digest }
@@ -623,8 +646,9 @@ export class QueryGatewayService {
     }
     // Metadata is intentionally sequenced after the two bounded view reads.
     // Blazegraph previously received this plus six SPARQL requests at once.
-    const subGraphResponse = await this.#readLimiter.run(() =>
-      this.dkg.listSubGraphs(cg, this.config.dkgTimeoutMs),
+    const subGraphResponse = await this.#readLimiter.run(
+      () => this.dkg.listSubGraphs(cg, this.config.dkgTimeoutMs),
+      this.#executionSignal.getStore(),
     );
 
     const layerGraphs: Record<VisibleMemoryLayer, { graph: string; label: string }[]> = {

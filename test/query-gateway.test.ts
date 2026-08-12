@@ -6,6 +6,7 @@ import oxigraph from 'oxigraph';
 import { loadQueryGatewayConfig } from '../src/config.ts';
 import type { DkgClient } from '../src/dkg/client.ts';
 import { QueryGateway } from '../src/query-gateway/server.ts';
+import { DkgReadLimiter } from '../src/query-gateway/read-limiter.ts';
 import { parseQueryGatewayRequest, QueryGatewayService } from '../src/query-gateway/service.ts';
 import type { QueryGatewayConfig } from '../src/types.ts';
 
@@ -674,6 +675,78 @@ describe('query gateway HTTP boundary', () => {
     const responses = await Promise.all([firstPending, secondPending]);
     expect(responses.map((response) => response.status)).toEqual([200, 200]);
     expect(gatedDkg.calls).toHaveLength(3);
+  });
+
+  it('does not repopulate a channel cache from a read invalidated while in flight', async () => {
+    const dkg = new GatedDkg();
+    const service = new QueryGatewayService(() => CONTEXT_GRAPH, dkg.asDkg(), gatewayConfig());
+    const requestBody = semanticBody(
+      'SELECT ?name WHERE { GRAPH ?g { <urn:decision:cache> <http://schema.org/name> ?name } } LIMIT 1',
+      'shared',
+    );
+
+    const staleRead = service.execute(requestBody);
+    await waitFor(() => dkg.started === 1);
+    service.invalidateChannel(CHANNEL);
+    dkg.release();
+    await staleRead;
+    await service.execute(requestBody);
+
+    expect(dkg.calls.filter((call) => call.kind === 'query')).toHaveLength(2);
+  });
+
+  it('keeps generic graph-only channel layers discoverable', async () => {
+    const dkg = new GatewayDkg();
+    dkg.bindingResolver = ({ view, sparql }) =>
+      sparql.includes('SELECT DISTINCT ?rowType')
+        ? [
+            {
+              rowType: binding('graph'),
+              g: binding(`urn:test:${view}:generic-only`),
+            },
+          ]
+        : [];
+    const service = new QueryGatewayService(() => CONTEXT_GRAPH, dkg.asDkg(), gatewayConfig());
+
+    const response = await service.execute(body('channel_memory'));
+
+    expect(response.result).toMatchObject({
+      layers: {
+        WM: null,
+        SWM: [{ graph: 'urn:test:shared-working-memory:generic-only' }],
+        VM: [{ graph: 'urn:test:verifiable-memory:generic-only' }],
+      },
+      decisions: [],
+      contributors: [],
+    });
+    const combined = dkg.calls.find((call) => call.sparql?.includes('SELECT DISTINCT ?rowType'));
+    expect(combined?.sparql).toContain('BIND("graph" AS ?rowType)');
+  });
+
+  it('removes timed-out work from the DKG read queue before it can execute', async () => {
+    const limiter = new DkgReadLimiter(1, 1);
+    let releaseFirst: (() => void) | undefined;
+    const first = limiter.run(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        }),
+    );
+    await waitFor(() => limiter.snapshot().active === 1);
+    const controller = new AbortController();
+    let queuedReadStarted = false;
+    const queued = limiter.run(async () => {
+      queuedReadStarted = true;
+    }, controller.signal);
+    await waitFor(() => limiter.snapshot().queued === 1);
+
+    controller.abort();
+
+    await expect(queued).rejects.toMatchObject({ code: 'gateway_timeout' });
+    expect(limiter.snapshot().queued).toBe(0);
+    releaseFirst?.();
+    await first;
+    expect(queuedReadStarted).toBe(false);
   });
 
   it('globally bounds DKG reads and sheds excess queued work with Retry-After', async () => {
