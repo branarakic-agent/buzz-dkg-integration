@@ -620,6 +620,10 @@ export async function install(options, prompt, context = installContext) {
     BDI_QUERY_GATEWAY_PORT: '9296',
     BDI_QUERY_GATEWAY_MAX_BODY_BYTES: String(256 * 1024),
     BDI_QUERY_GATEWAY_TIMEOUT_MS: '120000',
+    BDI_QUERY_GATEWAY_MAX_DKG_CONCURRENT: '1',
+    BDI_QUERY_GATEWAY_MAX_DKG_QUEUE: '32',
+    BDI_QUERY_GATEWAY_CACHE_TTL_MS: '120000',
+    BDI_QUERY_GATEWAY_MAX_CACHE_ENTRIES: '256',
     BUZZ_DKG_RELAY_CONTAINER:
       plan.relayManagement?.containerName || plan.relayManagement?.containerId || '',
   });

@@ -18,8 +18,16 @@ BDI_QUERY_GATEWAY_TOKEN=<32-to-512-character-secret>
 Only literal `127.0.0.1` and `::1` binds are accepted. Optional bounded
 settings are `BDI_QUERY_GATEWAY_MAX_BODY_BYTES`,
 `BDI_QUERY_GATEWAY_MAX_RESULT_BYTES`, `BDI_QUERY_GATEWAY_MAX_QUERY_BYTES`,
-`BDI_QUERY_GATEWAY_TIMEOUT_MS`, `BDI_QUERY_GATEWAY_DKG_TIMEOUT_MS`, and
-`BDI_QUERY_GATEWAY_MAX_CONCURRENT`.
+`BDI_QUERY_GATEWAY_TIMEOUT_MS`, `BDI_QUERY_GATEWAY_DKG_TIMEOUT_MS`,
+`BDI_QUERY_GATEWAY_MAX_CONCURRENT`, `BDI_QUERY_GATEWAY_MAX_DKG_CONCURRENT`,
+`BDI_QUERY_GATEWAY_MAX_DKG_QUEUE`, `BDI_QUERY_GATEWAY_CACHE_TTL_MS`, and
+`BDI_QUERY_GATEWAY_MAX_CACHE_ENTRIES`. The DKG concurrency ceiling is global
+to the gateway: one summary request cannot bypass it by fanning out into many
+triple-store reads. Identical in-flight requests are coalesced, and successful
+results are cached for the configured short TTL.
+The defaults serialize DKG reads and cache successful results for two minutes,
+which aligns with a Core node's single background store lane while still
+allowing memory writes to invalidate their channel immediately.
 
 The installer uses a 120-second end-to-end gateway deadline. Individual DKG
 lifecycle calls use a 180-second deadline. Memory submission returns HTTP `202`

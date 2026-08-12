@@ -202,6 +202,14 @@ export type QueryGatewayConfig =
       operationTimeoutMs: number;
       dkgTimeoutMs: number;
       maxConcurrent: number;
+      /** Global ceiling for reads admitted to the DKG API/triple store. */
+      maxDkgConcurrent: number;
+      /** Bounded wait queue behind the global DKG read ceiling. */
+      maxDkgQueue: number;
+      /** Successful query result lifetime; zero keeps only single-flight deduplication. */
+      cacheTtlMs: number;
+      /** Hard bound on community-scoped cached results. */
+      maxCacheEntries: number;
     };
 
 /** Normalized, non-empty labels Buzz may render for a service mention. */

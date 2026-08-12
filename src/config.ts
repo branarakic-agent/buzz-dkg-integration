@@ -140,6 +140,34 @@ export function loadQueryGatewayConfig(env: NodeJS.ProcessEnv): QueryGatewayConf
       1,
       32,
     ),
+    maxDkgConcurrent: envInteger(
+      'BDI_QUERY_GATEWAY_MAX_DKG_CONCURRENT',
+      env.BDI_QUERY_GATEWAY_MAX_DKG_CONCURRENT,
+      1,
+      1,
+      8,
+    ),
+    maxDkgQueue: envInteger(
+      'BDI_QUERY_GATEWAY_MAX_DKG_QUEUE',
+      env.BDI_QUERY_GATEWAY_MAX_DKG_QUEUE,
+      32,
+      1,
+      256,
+    ),
+    cacheTtlMs: envInteger(
+      'BDI_QUERY_GATEWAY_CACHE_TTL_MS',
+      env.BDI_QUERY_GATEWAY_CACHE_TTL_MS,
+      120_000,
+      0,
+      300_000,
+    ),
+    maxCacheEntries: envInteger(
+      'BDI_QUERY_GATEWAY_MAX_CACHE_ENTRIES',
+      env.BDI_QUERY_GATEWAY_MAX_CACHE_ENTRIES,
+      256,
+      1,
+      4_096,
+    ),
   };
 }
 

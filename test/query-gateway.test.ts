@@ -31,6 +31,10 @@ function gatewayConfig(overrides: Partial<EnabledConfig> = {}): EnabledConfig {
     operationTimeoutMs: 1_000,
     dkgTimeoutMs: 500,
     maxConcurrent: 4,
+    maxDkgConcurrent: 2,
+    maxDkgQueue: 32,
+    cacheTtlMs: 30_000,
+    maxCacheEntries: 256,
     ...overrides,
   };
 }
@@ -68,11 +72,12 @@ class GatewayDkg {
     if (resolved !== null && resolved !== undefined) {
       return { result: { bindings: resolved, ...(this.quads ? { quads: this.quads } : {}) } };
     }
-    if (options.sparql.includes('SAMPLE(?n)')) {
+    if (options.sparql.includes('SELECT DISTINCT ?rowType')) {
       return {
         result: {
           bindings: [
             {
+              rowType: { value: 'graph' },
               g: { value: `https://example.test/${options.view}/graph` },
               name: { value: `${options.view} graph` },
             },
@@ -110,6 +115,53 @@ class GatewayDkg {
   asDkg(): DkgClient {
     return this as unknown as DkgClient;
   }
+}
+
+class GatedDkg extends GatewayDkg {
+  #releaseGate: (() => void) | undefined;
+  readonly #gate: Promise<void>;
+  started = 0;
+  active = 0;
+  maxActive = 0;
+
+  constructor() {
+    super();
+    this.#gate = new Promise<void>((resolve) => {
+      this.#releaseGate = resolve;
+    });
+  }
+
+  release(): void {
+    this.#releaseGate?.();
+  }
+
+  async #gated<T>(read: () => Promise<T>): Promise<T> {
+    this.started += 1;
+    this.active += 1;
+    this.maxActive = Math.max(this.maxActive, this.active);
+    try {
+      await this.#gate;
+      return await read();
+    } finally {
+      this.active -= 1;
+    }
+  }
+
+  override query(...args: Parameters<GatewayDkg['query']>) {
+    return this.#gated(() => super.query(...args));
+  }
+
+  override listSubGraphs(...args: Parameters<GatewayDkg['listSubGraphs']>) {
+    return this.#gated(() => super.listSubGraphs(...args));
+  }
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error('condition was not reached');
 }
 
 const running: QueryGateway[] = [];
@@ -234,6 +286,24 @@ describe('query gateway configuration', () => {
         BDI_QUERY_GATEWAY_DKG_TIMEOUT_MS: '1001',
       }),
     ).toThrow(/must not exceed/);
+    expect(
+      loadQueryGatewayConfig({
+        BDI_QUERY_GATEWAY_ENABLED: 'true',
+        BDI_QUERY_GATEWAY_TOKEN: TOKEN,
+      }),
+    ).toMatchObject({
+      maxDkgConcurrent: 1,
+      maxDkgQueue: 32,
+      cacheTtlMs: 120_000,
+      maxCacheEntries: 256,
+    });
+    expect(() =>
+      loadQueryGatewayConfig({
+        BDI_QUERY_GATEWAY_ENABLED: 'true',
+        BDI_QUERY_GATEWAY_TOKEN: TOKEN,
+        BDI_QUERY_GATEWAY_MAX_DKG_CONCURRENT: '0',
+      }),
+    ).toThrow(/MAX_DKG_CONCURRENT/);
   });
 });
 
@@ -572,6 +642,124 @@ describe('query gateway HTTP boundary', () => {
         .every((call) => ['shared-working-memory', 'verifiable-memory'].includes(call.view ?? '')),
     ).toBe(true);
     expect(dkg.calls.some((call) => call.view === 'working-memory')).toBe(false);
+    expect(dkg.calls).toHaveLength(3);
+  });
+
+  it('keeps the combined channel summary valid SPARQL', async () => {
+    const dkg = new GatewayDkg();
+    dkg.bindingResolver = ({ sparql }) => fixtureQuery(sparql);
+    const service = new QueryGatewayService(() => CONTEXT_GRAPH, dkg.asDkg(), gatewayConfig());
+    const response = await service.execute(body('channel_memory'));
+    expect(response.operation).toBe('channel_memory');
+    expect(dkg.calls.filter((call) => call.kind === 'query')).toHaveLength(2);
+  });
+
+  it('caches and coalesces identical channel summaries', async () => {
+    const cachedDkg = new GatewayDkg();
+    const cached = await startGateway(cachedDkg);
+    const first = await request(cached.url, body('channel_memory'));
+    const second = await request(cached.url, body('channel_memory'));
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(cachedDkg.calls).toHaveLength(3);
+
+    const gatedDkg = new GatedDkg();
+    const coalesced = await startGateway(gatedDkg);
+    const firstPending = request(coalesced.url, body('channel_memory'));
+    await waitFor(() => gatedDkg.started === 1);
+    const secondPending = request(coalesced.url, body('channel_memory'));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(gatedDkg.started).toBe(1);
+    gatedDkg.release();
+    const responses = await Promise.all([firstPending, secondPending]);
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(gatedDkg.calls).toHaveLength(3);
+  });
+
+  it('globally bounds DKG reads and sheds excess queued work with Retry-After', async () => {
+    const boundedDkg = new GatedDkg();
+    const bounded = await startGateway(
+      boundedDkg,
+      gatewayConfig({ cacheTtlMs: 0, maxConcurrent: 4, maxDkgConcurrent: 2 }),
+    );
+    const reads = Array.from({ length: 4 }, (_, index) =>
+      request(
+        bounded.url,
+        semanticBody(
+          `SELECT ?name WHERE { GRAPH ?g { <urn:decision:${index}> <http://schema.org/name> ?name } } LIMIT 1`,
+          'shared',
+        ),
+      ),
+    );
+    await waitFor(() => boundedDkg.started === 2);
+    expect(boundedDkg.maxActive).toBe(2);
+    boundedDkg.release();
+    const boundedResponses = await Promise.all(reads);
+    expect(boundedResponses.every((response) => response.status === 200)).toBe(true);
+    expect(boundedDkg.maxActive).toBeLessThanOrEqual(2);
+
+    const overloadedDkg = new GatedDkg();
+    const overloaded = await startGateway(
+      overloadedDkg,
+      gatewayConfig({
+        cacheTtlMs: 0,
+        maxConcurrent: 4,
+        maxDkgConcurrent: 1,
+        maxDkgQueue: 1,
+      }),
+    );
+    const firstRead = request(
+      overloaded.url,
+      semanticBody(
+        'SELECT ?name WHERE { GRAPH ?g { <urn:decision:first> <http://schema.org/name> ?name } } LIMIT 1',
+        'shared',
+      ),
+    );
+    await waitFor(() => overloadedDkg.started === 1);
+    const queuedRead = request(
+      overloaded.url,
+      semanticBody(
+        'SELECT ?name WHERE { GRAPH ?g { <urn:decision:second> <http://schema.org/name> ?name } } LIMIT 1',
+        'shared',
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const rejectedRead = await request(
+      overloaded.url,
+      semanticBody(
+        'SELECT ?name WHERE { GRAPH ?g { <urn:decision:third> <http://schema.org/name> ?name } } LIMIT 1',
+        'shared',
+      ),
+    );
+    expect(rejectedRead.status).toBe(429);
+    expect(rejectedRead.headers.get('retry-after')).toBe('2');
+    await expect(rejectedRead.json()).resolves.toMatchObject({
+      error: { code: 'dkg_busy', details: { retryAfterSeconds: 2 } },
+    });
+    overloadedDkg.release();
+    expect((await firstRead).status).toBe(200);
+    expect((await queuedRead).status).toBe(200);
+  });
+
+  it('opens a short circuit after repeated upstream failures', async () => {
+    const dkg = new GatewayDkg();
+    dkg.failWith = 'triple store unavailable';
+    const { url } = await startGateway(dkg, gatewayConfig({ cacheTtlMs: 0 }));
+    for (let index = 0; index < 3; index += 1) {
+      const response = await request(
+        url,
+        body('evidence', { uri: `urn:buzz:claim:failure-${index}` }),
+      );
+      expect(response.status).toBe(502);
+    }
+    const callsBeforeCircuit = dkg.calls.length;
+    const cooledDown = await request(url, body('evidence', { uri: 'urn:buzz:claim:circuit-open' }));
+    expect(cooledDown.status).toBe(503);
+    expect(cooledDown.headers.get('retry-after')).toBe('15');
+    await expect(cooledDown.json()).resolves.toMatchObject({
+      error: { code: 'dkg_unavailable' },
+    });
+    expect(dkg.calls).toHaveLength(callsBeforeCircuit);
   });
 
   it.each([
@@ -776,18 +964,33 @@ describe('query gateway HTTP boundary', () => {
     const expectedAt = Date.parse(at) / 1_000;
     dkg.bindingResolver = (options) => {
       if (options.view !== 'verifiable-memory') return [];
-      if (options.sparql.includes('COUNT(DISTINCT ?event)')) {
-        return [{ pk: binding(CONTRIBUTOR), n: binding('2'), latest: binding(at) }];
-      }
-      if (options.sparql.includes('SELECT ?s ?name ?digest ?t')) {
+      if (options.sparql.includes('SELECT DISTINCT ?rowType')) {
         return [
           {
+            rowType: binding('graph'),
+            g: binding('urn:g'),
+            name: binding('Verifiable graph'),
+          },
+          {
+            rowType: binding('contributor'),
+            pk: binding(CONTRIBUTOR),
+            event: binding('urn:nostr:event:contribution-one'),
+            at: binding(at),
+          },
+          {
+            rowType: binding('contributor'),
+            pk: binding(CONTRIBUTOR),
+            event: binding('urn:nostr:event:contribution-two'),
+            at: binding(at),
+          },
+          {
+            rowType: binding('decision'),
             s: binding(decision),
             name: binding('Choose the graph store'),
             digest: binding('digest-one'),
             t: binding(at),
           },
-        ];
+        ] as Array<Record<string, { value: string }>>;
       }
       if (options.sparql.includes('SELECT ?event ?content ?at ?decision ?dname')) {
         return [

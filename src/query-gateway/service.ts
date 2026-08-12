@@ -30,6 +30,7 @@ import type {
   SubgraphTriplesResult,
   VisibleMemoryLayer,
 } from './types.ts';
+import { DkgReadLimiter } from './read-limiter.ts';
 
 type EnabledGatewayConfig = Extract<QueryGatewayConfig, { enabled: true }>;
 type BindingRow = Record<string, unknown>;
@@ -59,6 +60,8 @@ const MAX_GRAPH_EDGES = 2_400;
 const MAX_TRIPLES = 1_000;
 const MAX_SEMANTIC_ROWS = 100;
 const MAX_SEMANTIC_QUERY_TIMEOUT_MS = 10_000;
+const CIRCUIT_FAILURE_THRESHOLD = 3;
+const CIRCUIT_OPEN_MS = 15_000;
 
 const BUZZ = 'https://w3id.org/buzz-dkg/buzz#';
 const NOSTR = 'https://w3id.org/buzz-dkg/nostr#';
@@ -315,10 +318,25 @@ export function withGatewayTimeout<T>(promise: Promise<T>, timeoutMs: number): P
   });
 }
 
+export type QueryCacheStatus = 'hit' | 'miss' | 'coalesced';
+
+type QueryCacheEntry = {
+  channelId: string;
+  expiresAt: number;
+  value: QueryGatewaySuccess;
+};
+
+type QueryExecutionObserver = (status: QueryCacheStatus) => void;
+
 export class QueryGatewayService {
   readonly #resolveContextGraph: (channelId: string) => string | null | Promise<string | null>;
+  readonly #readLimiter: DkgReadLimiter;
+  readonly #cache = new Map<string, QueryCacheEntry>();
+  readonly #pending = new Map<string, Promise<QueryGatewaySuccess>>();
   readonly dkg: DkgClient;
   readonly config: EnabledGatewayConfig;
+  #consecutiveFailures = 0;
+  #circuitOpenUntil = 0;
 
   constructor(
     resolveContextGraph: (channelId: string) => string | null | Promise<string | null>,
@@ -328,9 +346,29 @@ export class QueryGatewayService {
     this.dkg = dkg;
     this.config = config;
     this.#resolveContextGraph = resolveContextGraph;
+    this.#readLimiter = new DkgReadLimiter(config.maxDkgConcurrent, config.maxDkgQueue);
   }
 
-  async execute(input: unknown): Promise<QueryGatewaySuccess> {
+  loadSnapshot(): ReturnType<DkgReadLimiter['snapshot']> & {
+    cacheEntries: number;
+    pendingQueries: number;
+    circuitOpen: boolean;
+  } {
+    return {
+      ...this.#readLimiter.snapshot(),
+      cacheEntries: this.#cache.size,
+      pendingQueries: this.#pending.size,
+      circuitOpen: Date.now() < this.#circuitOpenUntil,
+    };
+  }
+
+  invalidateChannel(channelId: string): void {
+    for (const [key, entry] of this.#cache) {
+      if (entry.channelId === channelId) this.#cache.delete(key);
+    }
+  }
+
+  async execute(input: unknown, observe?: QueryExecutionObserver): Promise<QueryGatewaySuccess> {
     const request = parseQueryGatewayRequest(input);
     const cg = await this.#resolveContextGraph(request.channelId);
     if (!cg) {
@@ -340,17 +378,91 @@ export class QueryGatewayService {
         'channel is not configured for DKG queries',
       );
     }
-    const result = await withGatewayTimeout(
-      this.dispatch(cg, request),
-      this.config.operationTimeoutMs,
-    );
-    return {
-      ok: true,
-      channelId: request.channelId,
+    const now = Date.now();
+    this.#pruneCache(now);
+    const key = JSON.stringify([
+      request.channelId,
       cg,
-      operation: request.operation,
-      result,
-    };
+      request.operation,
+      'scope' in request ? request.scope : null,
+      request.arguments,
+    ]);
+    const cached = this.#cache.get(key);
+    if (cached && cached.expiresAt > now) {
+      // Refresh insertion order so bounded eviction approximates LRU.
+      this.#cache.delete(key);
+      this.#cache.set(key, cached);
+      observe?.('hit');
+      return cached.value;
+    }
+    const pending = this.#pending.get(key);
+    if (pending) {
+      observe?.('coalesced');
+      return pending;
+    }
+    if (now < this.#circuitOpenUntil) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((this.#circuitOpenUntil - now) / 1_000));
+      throw new IntegrationApiError(
+        503,
+        'dkg_unavailable',
+        'DKG reads are cooling down after repeated upstream failures',
+        { retryAfterSeconds },
+      );
+    }
+
+    observe?.('miss');
+    const work = withGatewayTimeout(this.dispatch(cg, request), this.config.operationTimeoutMs)
+      .then((result) => {
+        this.#consecutiveFailures = 0;
+        this.#circuitOpenUntil = 0;
+        const value: QueryGatewaySuccess = {
+          ok: true,
+          channelId: request.channelId,
+          cg,
+          operation: request.operation,
+          result,
+        };
+        if (Buffer.byteLength(JSON.stringify(value), 'utf8') > this.config.maxResultBytes) {
+          throw new IntegrationApiError(502, 'result_too_large', 'query result exceeds the limit');
+        }
+        if (this.config.cacheTtlMs > 0) {
+          this.#cache.set(key, {
+            channelId: request.channelId,
+            expiresAt: Date.now() + this.config.cacheTtlMs,
+            value,
+          });
+          this.#pruneCache(Date.now());
+        }
+        return value;
+      })
+      .catch((error: unknown) => {
+        const upstreamFailure =
+          !(error instanceof IntegrationApiError) || error.code === 'gateway_timeout';
+        if (upstreamFailure) {
+          this.#consecutiveFailures += 1;
+          if (this.#consecutiveFailures >= CIRCUIT_FAILURE_THRESHOLD) {
+            this.#circuitOpenUntil = Date.now() + CIRCUIT_OPEN_MS;
+          }
+        }
+        throw error;
+      });
+    this.#pending.set(key, work);
+    try {
+      return await work;
+    } finally {
+      if (this.#pending.get(key) === work) this.#pending.delete(key);
+    }
+  }
+
+  #pruneCache(now: number): void {
+    for (const [key, entry] of this.#cache) {
+      if (entry.expiresAt <= now) this.#cache.delete(key);
+    }
+    while (this.#cache.size > this.config.maxCacheEntries) {
+      const oldest = this.#cache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.#cache.delete(oldest);
+    }
   }
 
   private async dispatch(cg: string, request: QueryGatewayRequest): Promise<QueryGatewayResult> {
@@ -391,9 +503,11 @@ export class QueryGatewayService {
     subGraphName?: string,
     timeoutMs = this.config.dkgTimeoutMs,
   ): Promise<{ bindings: BindingRow[]; quads?: unknown[] }> {
-    const response = await this.dkg.query(
-      { contextGraphId: cg, view, sparql, ...(subGraphName ? { subGraphName } : {}) },
-      timeoutMs,
+    const response = await this.#readLimiter.run(() =>
+      this.dkg.query(
+        { contextGraphId: cg, view, sparql, ...(subGraphName ? { subGraphName } : {}) },
+        timeoutMs,
+      ),
     );
     const rows = response?.result?.bindings;
     if (!Array.isArray(rows)) throw new Error('DKG query returned an invalid bindings shape');
@@ -472,80 +586,108 @@ export class QueryGatewayService {
     return batches.flat();
   }
 
-  private async layerOverview(
+  private async channelMemoryLayer(
     cg: string,
     view: VisibleView,
-  ): Promise<{ graph: string; label: string }[]> {
+    layer: VisibleMemoryLayer,
+  ): Promise<{ layer: VisibleMemoryLayer; rows: BindingRow[] }> {
     const rows = await this.query(
       cg,
       view,
-      `SELECT ?g (SAMPLE(?n) AS ?name) WHERE {
-         GRAPH ?g { ?s ?p ?o . OPTIONAL { ?s <${SCHEMA}name> ?n } }
-       } GROUP BY ?g LIMIT 200`,
+      `SELECT DISTINCT ?rowType ?g ?name ?s ?digest ?t ?pk ?event ?at WHERE {
+        GRAPH ?g {
+          {
+            ?s a <${BUZZ}DecisionCluster> .
+            OPTIONAL { ?s <${SCHEMA}name> ?name }
+            OPTIONAL { ?s <${BUZZ}sourceSetDigest> ?digest }
+            OPTIONAL { ?s <${PROV}endedAtTime> ?t }
+            BIND("decision" AS ?rowType)
+          }
+          UNION
+          {
+            ?event <${PROV}wasAttributedTo> ?agent .
+            ?agent <${NOSTR}pubkeyHex> ?pk .
+            OPTIONAL { ?event <${NOSTR}createdAt> ?at }
+            BIND("contributor" AS ?rowType)
+          }
+        }
+      } LIMIT 1000`,
     );
-    const seen = new Set<string>();
-    const out: { graph: string; label: string }[] = [];
-    for (const row of rows) {
-      const graph = bounded(term(row, 'g'), 1_000);
-      if (!graph || seen.has(graph)) continue;
-      seen.add(graph);
-      const label = optionalTerm(row, 'name') ?? graph.split('/').slice(-2).join('/');
-      out.push({ graph, label: bounded(label, 200) });
-    }
-    return out;
+    return { layer, rows };
   }
 
   private async channelMemory(cg: string): Promise<ChannelMemoryResult> {
-    const decisionsQuery = `SELECT ?s ?name ?digest ?t WHERE { GRAPH ?g {
-      ?s a <${BUZZ}DecisionCluster> .
-      OPTIONAL { ?s <${SCHEMA}name> ?name }
-      OPTIONAL { ?s <${BUZZ}sourceSetDigest> ?digest }
-      OPTIONAL { ?s <${PROV}endedAtTime> ?t }
-    } } LIMIT 200`;
-    const contributorsQuery = `SELECT ?pk (COUNT(DISTINCT ?event) AS ?n) (MAX(?at) AS ?latest)
-      WHERE { GRAPH ?g {
-        ?event <${PROV}wasAttributedTo> ?agent .
-        ?agent <${NOSTR}pubkeyHex> ?pk .
-        OPTIONAL { ?event <${NOSTR}createdAt> ?at }
-      } } GROUP BY ?pk ORDER BY DESC(?n) LIMIT 50`;
-    const [swm, vm, decisionRows, contributorRows, subGraphResponse] = await Promise.all([
-      this.layerOverview(cg, 'shared-working-memory'),
-      this.layerOverview(cg, 'verifiable-memory'),
-      this.layered(cg, decisionsQuery),
-      this.layered(cg, contributorsQuery),
+    const summaries: { layer: VisibleMemoryLayer; rows: BindingRow[] }[] = [];
+    for (const [view, layer] of VIEWS) {
+      summaries.push(await this.channelMemoryLayer(cg, view, layer));
+    }
+    // Metadata is intentionally sequenced after the two bounded view reads.
+    // Blazegraph previously received this plus six SPARQL requests at once.
+    const subGraphResponse = await this.#readLimiter.run(() =>
       this.dkg.listSubGraphs(cg, this.config.dkgTimeoutMs),
-    ]);
+    );
+
+    const layerGraphs: Record<VisibleMemoryLayer, { graph: string; label: string }[]> = {
+      SWM: [],
+      VM: [],
+    };
+    const seenGraphs: Record<VisibleMemoryLayer, Set<string>> = {
+      SWM: new Set<string>(),
+      VM: new Set<string>(),
+    };
 
     const decisionsByUri = new Map<string, DecisionSummary>();
-    for (const { row, layer } of decisionRows) {
-      const uri = bounded(term(row, 's'), 1_000);
-      if (!uri) continue;
-      const current = decisionsByUri.get(uri);
-      const candidate: DecisionSummary = {
-        uri,
-        name: optionalTerm(row, 'name') ? bounded(optionalTerm(row, 'name')!, 200) : null,
-        digest: optionalTerm(row, 'digest') ? bounded(optionalTerm(row, 'digest')!, 256) : null,
-        at: optionalTerm(row, 't') ? bounded(optionalTerm(row, 't')!, 128) : null,
-        layer,
-      };
-      if (!current || LAYER_RANK[layer] > LAYER_RANK[current.layer]) {
-        decisionsByUri.set(uri, candidate);
-      }
-    }
-
     const contributorsByPubkey = new Map<string, ContributorSummary>();
-    for (const { row, layer } of contributorRows) {
-      const pubkey = term(row, 'pk').toLowerCase();
-      if (!HEX_PUBKEY.test(pubkey)) continue;
-      const events = count(row.n);
-      const latest = dateTimestamp(row.latest);
-      const current = contributorsByPubkey.get(pubkey);
-      if (!current) {
-        contributorsByPubkey.set(pubkey, { pubkey, events, latest, layer });
-      } else {
-        current.events = Math.max(current.events, events);
-        current.latest = Math.max(current.latest ?? 0, latest ?? 0) || null;
-        if (LAYER_RANK[layer] > LAYER_RANK[current.layer]) current.layer = layer;
+    const contributorEvents = new Map<string, Set<string>>();
+    for (const { rows, layer } of summaries) {
+      for (const row of rows) {
+        const rowType = term(row, 'rowType');
+        const graph = bounded(term(row, 'g'), 1_000);
+        if (graph && !seenGraphs[layer].has(graph)) {
+          seenGraphs[layer].add(graph);
+          const label = optionalTerm(row, 'name') ?? graph.split('/').slice(-2).join('/');
+          layerGraphs[layer].push({ graph, label: bounded(label, 200) });
+        }
+        if (rowType === 'graph') {
+          continue;
+        }
+        if (rowType === 'contributor') {
+          const pubkey = term(row, 'pk').toLowerCase();
+          if (!HEX_PUBKEY.test(pubkey)) continue;
+          const eventKey = `${layer}:${pubkey}`;
+          let eventsForLayer = contributorEvents.get(eventKey);
+          if (!eventsForLayer) {
+            eventsForLayer = new Set<string>();
+            contributorEvents.set(eventKey, eventsForLayer);
+          }
+          const event = optionalTerm(row, 'event');
+          if (event) eventsForLayer.add(event);
+          const events = eventsForLayer.size || count(row.n);
+          const latest = dateTimestamp(row.at ?? row.latest);
+          const current = contributorsByPubkey.get(pubkey);
+          if (!current) {
+            contributorsByPubkey.set(pubkey, { pubkey, events, latest, layer });
+          } else {
+            current.events = Math.max(current.events, events);
+            current.latest = Math.max(current.latest ?? 0, latest ?? 0) || null;
+            if (LAYER_RANK[layer] > LAYER_RANK[current.layer]) current.layer = layer;
+          }
+          continue;
+        }
+        if (rowType !== 'decision') continue;
+        const uri = bounded(term(row, 's'), 1_000);
+        if (!uri) continue;
+        const current = decisionsByUri.get(uri);
+        const candidate: DecisionSummary = {
+          uri,
+          name: optionalTerm(row, 'name') ? bounded(optionalTerm(row, 'name')!, 200) : null,
+          digest: optionalTerm(row, 'digest') ? bounded(optionalTerm(row, 'digest')!, 256) : null,
+          at: optionalTerm(row, 't') ? bounded(optionalTerm(row, 't')!, 128) : null,
+          layer,
+        };
+        if (!current || LAYER_RANK[layer] > LAYER_RANK[current.layer]) {
+          decisionsByUri.set(uri, candidate);
+        }
       }
     }
 
@@ -567,7 +709,7 @@ export class QueryGatewayService {
       }));
 
     return {
-      layers: { WM: null, SWM: swm, VM: vm },
+      layers: { WM: null, SWM: layerGraphs.SWM, VM: layerGraphs.VM },
       decisions: [...decisionsByUri.values()],
       contributors: [...contributorsByPubkey.values()].sort(
         (a, b) => b.events - a.events || a.pubkey.localeCompare(b.pubkey),

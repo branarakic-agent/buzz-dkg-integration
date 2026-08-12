@@ -672,6 +672,10 @@ describe('automatic channel memory lifecycle', () => {
         operationTimeoutMs: 1_000,
         dkgTimeoutMs: 500,
         maxConcurrent: 4,
+        maxDkgConcurrent: 2,
+        maxDkgQueue: 32,
+        cacheTtlMs: 30_000,
+        maxCacheEntries: 256,
       },
     );
     await expect(
