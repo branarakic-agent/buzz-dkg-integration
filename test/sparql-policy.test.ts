@@ -93,6 +93,18 @@ describe('agent-authored SPARQL policy', () => {
     );
     expect(aggregate.code).toBe('query_too_expensive');
     expect(aggregate.details).toMatchObject({ metrics: { aggregates: 1 } });
+
+    const havingAggregate = failure(
+      'SELECT ?s WHERE { GRAPH ?g { ?s <urn:p> ?o } } GROUP BY ?s HAVING(COUNT(?o) > 10) LIMIT 25',
+    );
+    expect(havingAggregate.code).toBe('query_too_expensive');
+    expect(havingAggregate.details).toMatchObject({ metrics: { aggregates: 1 } });
+
+    const orderAggregate = failure(
+      'SELECT ?s WHERE { GRAPH ?g { ?s <urn:p> ?o } } GROUP BY ?s ORDER BY DESC(COUNT(?o)) LIMIT 25',
+    );
+    expect(orderAggregate.code).toBe('query_too_expensive');
+    expect(orderAggregate.details).toMatchObject({ metrics: { aggregates: 1 } });
   });
 
   it('permits a fully variable pattern only when VALUES anchors one variable', () => {

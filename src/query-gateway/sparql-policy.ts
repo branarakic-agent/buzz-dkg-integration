@@ -259,12 +259,13 @@ export function enforceSemanticQueryPolicy(
     groupConditions: 0,
     distinct: ast.distinct === true ? 1 : 0,
   };
-  walk(ast.variables, (node) => {
-    if (node.type === 'expression' && node.subType === 'aggregate') metrics.aggregates += 1;
-  });
   const modifiers = object(ast.solutionModifiers) ? ast.solutionModifiers : {};
   const order = object(modifiers.order) ? modifiers.order : null;
   const group = object(modifiers.group) ? modifiers.group : null;
+  const having = object(modifiers.having) ? modifiers.having : null;
+  walk([ast.variables, order, having], (node) => {
+    if (node.type === 'expression' && node.subType === 'aggregate') metrics.aggregates += 1;
+  });
   metrics.orderConditions = order && Array.isArray(order.orderDefs) ? order.orderDefs.length : 0;
   metrics.groupConditions = group && Array.isArray(group.groupings) ? group.groupings.length : 0;
   walk(ast.where, (node) => {
